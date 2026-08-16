@@ -8,29 +8,112 @@
         name: clickhouse-server
         state: restarted
   tasks:
-    - block:
-        - name: Get clickhouse distrib
-          ansible.builtin.get_url:
-            url: "https://packages.clickhouse.com/rpm/stable/{{ item }}-{{ clickhouse_version }}.noarch.rpm"
-            dest: "./{{ item }}-{{ clickhouse_version }}.rpm"
-          with_items: "{{ clickhouse_packages }}"
-      rescue:
-        - name: Get clickhouse distrib
-          ansible.builtin.get_url:
-            url: "https://packages.clickhouse.com/rpm/stable/clickhouse-common-static-{{ clickhouse_version }}.x86_64.rpm"
-            dest: "./clickhouse-common-static-{{ clickhouse_version }}.rpm"
+    - name: Add clickhouse repo
+      become: true
+      ansible.builtin.copy:
+        dest: /etc/yum.repos.d/clickhouse.repo
+        content: |
+          [clickhouse-stable]
+          name=ClickHouse Stable
+          baseurl=https://packages.clickhouse.com/rpm/stable/
+          enabled=1
+          gpgcheck=0
+        mode: '0644'
+
     - name: Install clickhouse packages
       become: true
       ansible.builtin.yum:
         name:
-          - clickhouse-common-static-{{ clickhouse_version }}.rpm
-          - clickhouse-client-{{ clickhouse_version }}.rpm
-          - clickhouse-server-{{ clickhouse_version }}.rpm
+          - clickhouse-server
+          - clickhouse-client
+        state: present
+        disable_gpg_check: true
       notify: Start clickhouse service
+
     - name: Flush handlers
-      meta: flush_handlers
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for clickhouse to start
+      ansible.builtin.pause:
+        seconds: 5
+
     - name: Create database
       ansible.builtin.command: "clickhouse-client -q 'create database logs;'"
       register: create_db
-      failed_when: create_db.rc != 0 and create_db.rc !=82
+      failed_when: create_db.rc != 0 and create_db.rc != 82
       changed_when: create_db.rc == 0
+
+- name: Install Vector
+  hosts: vector
+  become: true
+  handlers:
+    - name: Restart vector service
+      ansible.builtin.service:
+        name: vector
+        state: restarted
+  tasks:
+    - name: Create vector directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - "{{ vector_install_dir }}"
+        - "{{ vector_config_dir }}"
+
+    - name: Get vector distrib
+      ansible.builtin.get_url:
+        url: "https://packages.timber.io/vector/{{ vector_version }}/vector-{{ vector_version }}-x86_64-unknown-linux-gnu.tar.gz"
+        dest: "/tmp/vector-{{ vector_version }}.tar.gz"
+        mode: '0644'
+
+    - name: Unarchive vector
+      ansible.builtin.unarchive:
+        src: "/tmp/vector-{{ vector_version }}.tar.gz"
+        dest: "{{ vector_install_dir }}"
+        remote_src: true
+        extra_opts: [--strip-components=1]
+
+    - name: Create symlink for vector binary
+      ansible.builtin.file:
+        src: "{{ vector_install_dir }}/bin/vector"
+        dest: "/usr/local/bin/vector"
+        state: link
+        force: true
+
+    - name: Deploy Vector config
+      ansible.builtin.template:
+        src: vector.toml.j2
+        dest: "{{ vector_config_dir }}/vector.toml"
+        mode: '0644'
+      notify: Restart vector service
+
+    - name: Create vector systemd service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/vector.service
+        content: |
+          [Unit]
+          Description=Vector
+          Documentation=https://vector.dev
+          After=network-online.target
+          Requires=network-online.target
+
+          [Service]
+          User=root
+          Group=root
+          ExecStart=/usr/local/bin/vector --config /etc/vector/vector.toml
+          Restart=always
+
+          [Install]
+          WantedBy=multi-user.target
+        mode: '0644'
+
+    - name: Reload systemd daemon
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Ensure vector service is running
+      ansible.builtin.service:
+        name: vector
+        state: started
+        enabled: true
